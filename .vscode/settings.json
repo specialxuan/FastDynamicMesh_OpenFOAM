@@ -1,0 +1,11 @@
+{
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "clangd.path": "/usr/bin/clangd",
+    "cSpell.words": [
+        "anipulation",
+        "Coeffs",
+        "Coor",
+        "ield",
+        "peration"
+    ]
+}

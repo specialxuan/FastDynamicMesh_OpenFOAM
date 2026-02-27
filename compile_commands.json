@@ -1,0 +1,39 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-std=c++17",
+      "-m64",
+      "-pthread",
+      "-DOPENFOAM=2412",
+      "-DWM_DP",
+      "-DWM_LABEL_SIZE=32",
+      "-Wall",
+      "-Wextra",
+      "-Wold-style-cast",
+      "-Wnon-virtual-dtor",
+      "-Wno-unused-parameter",
+      "-Wno-invalid-offsetof",
+      "-Wno-attributes",
+      "-Wno-unknown-pragmas",
+      "-O3",
+      "-DNoRepository",
+      "-ftemplate-depth-100",
+      "-I/usr/lib/openfoam/openfoam2412/src/dynamicFvMesh/lnInclude",
+      "-I/usr/lib/openfoam/openfoam2412/src/finiteVolume/lnInclude",
+      "-I/usr/lib/openfoam/openfoam2412/src/meshTools/lnInclude",
+      "-iquote.",
+      "-IlnInclude",
+      "-I/usr/lib/openfoam/openfoam2412/src/OpenFOAM/lnInclude",
+      "-I/usr/lib/openfoam/openfoam2412/src/OSspecific/POSIX/lnInclude",
+      "-fPIC",
+      "-c",
+      "-o",
+      "Make/linux64GccDPInt32Opt/fastDynamicFvMesh/fastDynamicFvMesh.o",
+      "fastDynamicFvMesh/fastDynamicFvMesh.C"
+    ],
+    "directory": "/root/OpenFOAM/user-v2412/src/FastDynamic",
+    "file": "/root/OpenFOAM/user-v2412/src/FastDynamic/fastDynamicFvMesh/fastDynamicFvMesh.C",
+    "output": "/root/OpenFOAM/user-v2412/src/FastDynamic/Make/linux64GccDPInt32Opt/fastDynamicFvMesh/fastDynamicFvMesh.o"
+  }
+]
