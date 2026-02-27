@@ -16,6 +16,7 @@ Description
 #include "surfaceFields.H"
 #include "syncTools.H"
 #include "SortableList.H"
+#include "Pstream.H"
 #include <fstream>
 #include <sstream>
 
@@ -51,8 +52,18 @@ fastDynamicFvMesh::~fastDynamicFvMesh()
 void fastDynamicFvMesh::readControls()
 {
     // Read dictionary
-    const dictionary& dynamicMeshDict = 
-        this->lookupObject<dictionary>("dynamicMeshDict");
+    IOdictionary dynamicMeshDict
+    (
+        IOobject
+        (
+            "dynamicMeshDict",
+            this->time().constant(),
+            *this,
+            IOobject::MUST_READ_IF_MODIFIED,
+            IOobject::NO_WRITE,
+            false
+        )
+    );
     
     if (dynamicMeshDict.found(typeName + "Coeffs"))
     {

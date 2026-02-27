@@ -1,4 +1,0 @@
-SOURCE = \
-fastDynamicFvMesh/fastDynamicFvMesh.C \
-
-# sources
