@@ -160,6 +160,10 @@ void fastDynamicFvMesh::readModeShapes()
     // Broadcast data
     Pstream::broadcast(modeFreq_);
     Pstream::broadcast(csvPoints);
+    
+    // Resize csvShapes on all procs to ensure loop consistency
+    csvShapes.setSize(nMode_);
+    
     forAll(csvShapes, m) Pstream::broadcast(csvShapes[m]);
 
     // Map to local mesh points
