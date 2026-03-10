@@ -1,12 +1,15 @@
 {
     "C_Cpp.intelliSenseEngine": "disabled",
     "clangd.path": "/usr/bin/clangd",
+    "editor.wordWrap": "off",
     "cSpell.words": [
         "Allclean",
         "anipulation",
         "Coeffs",
         "Coor",
         "ield",
+        "libfast",
+        "libso",
         "pcorr",
         "peration",
         "Pstream",

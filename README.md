@@ -1,10 +1,9 @@
-Fast Dynamic Mesh for OpenFOAM
-==============================
+# Fast Dynamic Mesh for OpenFOAM
 
 This library implements a fast dynamic mesh method based on modal superposition, ported from an ANSYS Fluent UDF.
 
-Usage
------
+## Usage
+
 1. Compile the library:
    wmake libso
 
@@ -12,12 +11,12 @@ Usage
    libs ( "libfastDynamicFvMesh.so" );
 
 3. Configure `constant/dynamicMeshDict`:
-   dynamicFvMesh   fastDynamicFvMesh;
-   
+   dynamicFvMesh fastDynamicFvMesh;
+
    fastDynamicFvMeshCoeffs
    {
-       theta       1.4;            // Wilson-Theta parameter
-       fsiPatches  ( "wall" );     // List of patches where fluid forces are calculated
+   theta 1.4; // Wilson-Theta parameter
+   fsiPatches ( "wall" ); // List of patches where fluid forces are calculated
    }
 
 4. Input Files

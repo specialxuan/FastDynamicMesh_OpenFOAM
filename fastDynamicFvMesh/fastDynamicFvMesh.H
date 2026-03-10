@@ -69,6 +69,9 @@ class fastDynamicFvMesh
         //- FSI patch names
         wordRes fsiPatches_;
 
+        //- Initialized flag
+        bool initialised_;
+
 
     // Private Member Functions
 

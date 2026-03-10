@@ -19,6 +19,8 @@ Description
 #include "Pstream.H"
 #include <fstream>
 #include <sstream>
+#include <iomanip>
+#include <algorithm>
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -36,7 +38,8 @@ fastDynamicFvMesh::fastDynamicFvMesh(const IOobject& io)
 :
     dynamicFvMesh(io),
     nMode_(0),
-    theta_(1.4) // Default Wilson-Theta
+    theta_(1.4), // Default Wilson-Theta
+    initialised_(false)
 {
     readControls();
     readModeShapes();
@@ -87,58 +90,108 @@ void fastDynamicFvMesh::readModeShapes()
     if (Pstream::master())
     {
         Info<< "Reading mode coordinates..." << endl;
-        std::ifstream file("mode/FluidNodeCoor.csv");
+        
+        // Handle parallel path: time().path() points to processorX in parallel
+        // We need the global case root for mode files
+        fileName modeDir = this->time().path()/"mode";
+        if (Pstream::parRun())
+        {
+             // In parallel, try parent directory if local doesn't exist
+             if (!exists(modeDir))
+             {
+                 modeDir = this->time().path().path()/"mode";
+             }
+        }
+        
+        fileName coorPath = modeDir/"FluidNodeCoor.csv";
+        Info<< "Trying to open: " << coorPath << endl;
+
+        std::ifstream file(coorPath);
         if (!file.good())
         {
              // Warning instead of FatalError to allow testing without files
-             WarningInFunction << "Cannot open mode/FluidNodeCoor.csv" << endl;
+             WarningInFunction << "Cannot open " << coorPath << endl;
         }
         else
         {
             scalar dummy, nNode, nMode;
             char comma;
-            file >> dummy >> comma >> nNode >> comma >> nMode;
+            // Add robust parsing for header
+            // Read line, replace commas with spaces, read numbers
+            string line;
+            std::getline(file, line);
+            std::replace(line.begin(), line.end(), ',', ' ');
+            std::stringstream ss(line);
+            ss >> dummy >> nNode >> nMode;
             
             nCsvNodes = label(nNode);
             nMode_ = label(nMode);
             
+            Info<< "  Found " << nCsvNodes << " nodes and " << nMode_ << " modes in CSV." << endl;
+
+            modeFreq_.setSize(nMode_); // Resize here on master
             csvPoints.setSize(nCsvNodes);
             csvShapes.setSize(nMode_);
             forAll(csvShapes, m) csvShapes[m].setSize(nCsvNodes);
 
-            // Skip rest of header line
-            string line;
-            std::getline(file, line); 
+            // Skip rest of first line (already read)
+            // std::getline(file, line); 
 
             for (label i=0; i<nCsvNodes; ++i)
             {
                 scalar x, y, z;
                 char c;
-                file >> x >> c >> y >> c >> z;
+                // Robust parsing for coordinates
+                // Read 3 numbers separated by commas
+                // file >> x >> c >> y >> c >> z; 
+                // This fails if there are spaces around comma.
+                // Better: read line, replace commas, read numbers
+                std::getline(file, line);
+                std::replace(line.begin(), line.end(), ',', ' ');
+                std::stringstream ss2(line);
+                ss2 >> x >> y >> z;
+                
                 csvPoints[i] = point(x, y, z);
             }
             
             // Read mode shapes
             for (label m=0; m<nMode_; ++m)
             {
-                 std::ostringstream ss;
-                 ss << "mode/FluidNodeDisp" << (m+1) << ".csv";
-                 std::ifstream mFile(ss.str());
+                 fileName shapePath = modeDir/("FluidNodeDisp" + std::to_string(m+1) + ".csv");
+                 std::ifstream mFile(shapePath);
                  
+                 string line;
+                 std::getline(mFile, line);
+                 // First line is frequency
+                 std::stringstream ss(line);
                  scalar freq;
-                 if (mFile >> freq)
+                 if (ss >> freq)
                  {
-                    modeFreq_.setSize(nMode_);
                     modeFreq_[m] = freq;
+                    Info<< "  Mode " << m << " Freq: " << freq << endl;
+                 }
+                 else
+                 {
+                    Info<< "  Warning: Failed to read frequency for mode " << m << endl;
                  }
                  
-                 std::getline(mFile, line); // Skip rest of header
+                 // Second line is header, skip?
+                 // Wait, original logic read `freq` then skipped line.
+                 // The file format:
+                 // Frequency
+                 // Header
+                 // Data
+                 
+                 std::getline(mFile, line); // Skip header line
                  
                  for (label i=0; i<nCsvNodes; ++i)
                  {
+                     std::getline(mFile, line);
+                     std::replace(line.begin(), line.end(), ',', ' ');
+                     std::stringstream ss2(line);
+                     
                      scalar dx, dy, dz;
-                     char c;
-                     mFile >> dx >> c >> dy >> c >> dz;
+                     ss2 >> dx >> dy >> dz;
                      csvShapes[m][i] = vector(dx, dy, dz);
                  }
             }
@@ -150,7 +203,8 @@ void fastDynamicFvMesh::readModeShapes()
     Pstream::broadcast(nCsvNodes);
     
     // Resize local arrays
-    modeFreq_.setSize(nMode_);
+    if (!Pstream::master()) modeFreq_.setSize(nMode_); // Only slaves need resize now
+
     modeForce_.setSize(nMode_, 0.0);
     modeForce0_.setSize(nMode_, 0.0);
     modeState_.setSize(nMode_, vector::zero);
@@ -177,9 +231,11 @@ void fastDynamicFvMesh::readModeShapes()
 
     // Brute force search (simplest correct implementation)
     // Only perform mapping if we have CSV nodes
+    label mappedCount = 0;
     if (nCsvNodes > 0)
     {
-        scalar tolSqr = 1e-12; 
+        // Increased tolerance for coordinate matching
+        scalar tolSqr = 1e-8; // 0.1 mm tolerance
         
         forAll(localPoints, pI)
         {
@@ -199,6 +255,7 @@ void fastDynamicFvMesh::readModeShapes()
             
             if (minDistSqr < tolSqr && nearestIdx != -1)
             {
+                mappedCount++;
                 for (label m=0; m<nMode_; ++m)
                 {
                     modeShapes_[m][pI] = csvShapes[m][nearestIdx];
@@ -206,22 +263,80 @@ void fastDynamicFvMesh::readModeShapes()
             }
         }
     }
+    Info<< "Mapped " << mappedCount << " points out of " << localPoints.size() << " local mesh points." << endl;
 }
 
 void fastDynamicFvMesh::calcModalForces()
 {
     // Initialize forces
     modeForce_ = 0.0;
+    
+    // Default density (kinematic = 1.0)
+    // Hardcoded for water validation case
+    scalar rho = 1000.0; 
+    
+    // Check if we have rho field (compressible)
+    if (this->foundObject<volScalarField>("rho"))
+    {
+        // For compressible, forces should naturally integrate p (which is P_abs).
+        // BUT, OpenFOAM compressible p is usually Pa.
+        // Incompressible p is m^2/s^2.
+        // We assume here the user wants forces in Newtons.
+        // If "rho" field exists, p is likely Pa, so we don't multiply by rho.
+        // So rho factor remains 1.0.
+        rho = 1.0;
+    }
+    else
+    {
+        // Incompressible: p is p_kinematic. Need rhoRef.
+        IOdictionary transportProperties
+        (
+            IOobject
+            (
+                "transportProperties",
+                this->time().constant(),
+                *this,
+                IOobject::MUST_READ,
+                IOobject::NO_WRITE
+            )
+        );
+        
+        if (transportProperties.found("rho"))
+        {
+             transportProperties.lookup("rho") >> rho;
+        }
+    }
 
+    if (Pstream::master())
+    {
+        Info<< "DEBUG: Using rho=" << rho << endl;
+    }
+    
     if (this->foundObject<volScalarField>("p"))
     {
         const volScalarField& p = this->lookupObject<volScalarField>("p");
+        
+        // Debug p range
+        scalar pMin = gMin(p);
+        scalar pMax = gMax(p);
+        if (Pstream::master())
+        {
+             Info << "DEBUG: p range [" << pMin << ", " << pMax << "]" << endl;
+        }
         
         // Iterate over FSI patches
         forAll(fsiPatches_, i)
         {
             label patchID = this->boundaryMesh().findPatchID(fsiPatches_[i]);
-            if (patchID == -1) continue;
+            if (patchID == -1) 
+            {
+                Info<< "Warning: FSI patch " << fsiPatches_[i] << " not found!" << endl;
+                continue;
+            }
+            else
+            {
+                //Info<< "Processing FSI patch: " << fsiPatches_[i] << endl;
+            }
 
             const polyPatch& pp = this->boundaryMesh()[patchID];
             const fvPatchScalarField& pPatch = p.boundaryField()[patchID];
@@ -231,6 +346,13 @@ void fastDynamicFvMesh::calcModalForces()
                 // Calculate pressure force on face
                 vector f = pPatch[faceI] * pp.faceAreas()[faceI];
                 
+                // Scale by density if incompressible (rho was set above)
+                // If compressible (rho=1 above), f is already Newtons.
+                // Wait, if compressible, p is Pa. f is N. rho=1. Correct.
+                // If incompressible, p is m2/s2. f is m4/s2. Multiply by kg/m3. f is kg*m/s2 = N. Correct.
+                
+                f *= rho;
+
                 // Get face points to interpolate mode shape
                 const labelList& fPoints = pp[faceI];
                 
@@ -254,6 +376,60 @@ void fastDynamicFvMesh::calcModalForces()
     // Parallel reduction
     Pstream::listCombineGather(modeForce_, plusEqOp<scalar>());
     Pstream::broadcast(modeForce_);
+
+    if (Pstream::master())
+    {
+         Info << "DEBUG: rho=" << rho << endl;
+         Info << "DEBUG: Mode Forces (0-4): ";
+         for(label i=0; i<min(5, nMode_); ++i) Info << modeForce_[i] << " ";
+         Info << endl;
+    }
+    
+    // Output diagnostics to file
+    if (Pstream::master())
+    {
+        // Open file in append mode
+        std::ofstream diagFile;
+        bool writeHeader = false;
+        
+        // Simple logic: if file doesn't exist, write header
+        std::ifstream check("modal_diagnostics.csv");
+        if (!check.good())
+        {
+             writeHeader = true;
+        }
+        check.close();
+
+        diagFile.open("modal_diagnostics.csv", std::ios::app);
+
+        if (diagFile.good())
+        {
+            if (writeHeader)
+            {
+                diagFile << "Time";
+                for(label i=0; i<nMode_; ++i) diagFile << ",Force_" << (i+1);
+                for(label i=0; i<nMode_; ++i) 
+                {
+                    diagFile << ",Disp_" << (i+1) 
+                             << ",Vel_" << (i+1) 
+                             << ",Acc_" << (i+1);
+                }
+                diagFile << "\n";
+            }
+            
+            diagFile << std::setprecision(12); // Apply to all
+            diagFile << this->time().value();
+            for(label i=0; i<nMode_; ++i) diagFile << "," << modeForce_[i];
+            for(label i=0; i<nMode_; ++i) 
+            {
+                diagFile << "," << modeState_[i].x() 
+                         << "," << modeState_[i].y() 
+                         << "," << modeState_[i].z();
+            }
+            diagFile << "\n";
+            diagFile.close();
+        }
+    }
 }
 
 void fastDynamicFvMesh::solveStructuralDynamics(scalar dt)
@@ -272,6 +448,15 @@ void fastDynamicFvMesh::solveStructuralDynamics(scalar dt)
         scalar F_this = modeForce_[i];
         scalar F_last = modeForce0_[i];
         scalar freq = modeFreq_[i];
+        
+        // Debug
+        /*
+        if (Pstream::master() && i==0)
+        {
+             Info<< "Mode 0: Freq=" << freq << " F_this=" << F_this << " F_last=" << F_last << endl;
+        }
+        */
+
         scalar omega = 2.0 * constant::mathematical::pi * freq;
         
         // Ensure non-zero denominator logic
@@ -291,6 +476,21 @@ void fastDynamicFvMesh::solveStructuralDynamics(scalar dt)
         
         vel = velLast + 0.5*dt*(acc + accLast);
         dis = disLast + dt*velLast + sqr(dt)/6.0*(acc + 2.0*accLast);
+
+        /*
+        if (Pstream::master() && i==0)
+        {
+             Info << "Mode 0 Step:"
+                  << " dt=" << dt
+                  << " theta=" << theta_
+                  << " F_this=" << F_this 
+                  << " load=" << load 
+                  << " effK=" << effectiveK 
+                  << " disTheta=" << disTheta
+                  << " dis=" << dis 
+                  << " acc=" << acc << endl;
+        }
+        */
         
         modeState_[i] = vector(dis, vel, acc);
     }
@@ -298,6 +498,8 @@ void fastDynamicFvMesh::solveStructuralDynamics(scalar dt)
 
 bool fastDynamicFvMesh::update()
 {
+    if (Pstream::master()) Info<< "DEBUG: Starting update()" << endl;
+
     // 1. Calculate time step
     scalar dt = this->time().deltaTValue();
     
@@ -306,16 +508,59 @@ bool fastDynamicFvMesh::update()
     modeState0_ = modeState_;
 
     // 2. Calculate forces
+    if (Pstream::master()) Info<< "DEBUG: Calling calcModalForces()" << endl;
     calcModalForces();
+    if (Pstream::master()) Info<< "DEBUG: Finished calcModalForces()" << endl;
+
+    // Initialization logic to prevent start-up shock
+    if (!initialised_)
+    {
+        if (Pstream::master())
+        {
+            Info<< "Initializing Fast Dynamic Mesh state (acceleration balance)..." << endl;
+        }
+
+        for (label i=0; i<nMode_; ++i)
+        {
+             scalar F = modeForce_[i];
+             scalar v = 0.0;
+             if (i < initVelocity_.size()) v = initVelocity_[i];
+             
+             // Initial acceleration to balance force (Mass=1, Damp=0, Stiffness=0 at d=0)
+             scalar a = F; 
+             
+             modeState_[i] = vector(0.0, v, a);
+             
+             // Update history to be consistent for next step
+             modeState0_[i] = modeState_[i];
+             modeForce0_[i] = modeForce_[i];
+        }
+        
+        initialised_ = true;
+        
+        // Skip mesh motion on first step
+        if (Pstream::master()) Info<< "DEBUG: Skipping mesh motion (initialization)" << endl;
+        return true;
+    }
 
     // 3. Solve dynamics
     if (nMode_ > 0)
     {
+        if (Pstream::master()) Info<< "DEBUG: Calling solveStructuralDynamics()" << endl;
         solveStructuralDynamics(dt);
+        if (Pstream::master()) Info<< "DEBUG: Finished solveStructuralDynamics()" << endl;
     }
 
     // 4. Update mesh points
+    if (Pstream::master()) Info<< "DEBUG: Updating mesh points" << endl;
     pointField newPoints = this->points(); 
+ 
+
+    // Debug output:
+    if (Pstream::master() && nMode_ > 0)
+    {
+        Info<< "Time: " << this->time().value() << " First Mode Disp: " << modeState_[0].x() << endl;
+    }
 
     for (label m=0; m<nMode_; ++m)
     {
