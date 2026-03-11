@@ -46,6 +46,12 @@ class fastDynamicFvMesh
         //- Modal force (current time step)
         scalarField modeForce_;
 
+        //- Pressure contribution to modal force
+        scalarField modePressureForce_;
+
+        //- Viscous wall-shear contribution to modal force
+        scalarField modeShearForce_;
+
         //- Modal force (previous time step)
         scalarField modeForce0_;
 
@@ -59,6 +65,9 @@ class fastDynamicFvMesh
         //- Initial modal velocity
         scalarField initVelocity_;
 
+        //- Relaxed modal displacement actually imposed on the mesh
+        scalarField appliedModeDisp_;
+
         //- Mode shapes (displacement field per mode)
         //  Stores full field for simplicity
         List<vectorField> modeShapes_;
@@ -69,11 +78,29 @@ class fastDynamicFvMesh
         //- Point-mapping tolerance used for legacy CSV node matching
         scalar mappingTolerance_;
 
+        //- Relaxation applied to structural modal displacement before moving mesh
+        scalar couplingRelaxation_;
+
+        //- Pressure field used for modal loading
+        word pressureFieldName_;
+
+        //- Reference density for kinematic pressure fields
+        scalar rhoRef_;
+
         //- FSI patch names
         wordRes fsiPatches_;
 
+        //- Write per-face modal-force diagnostics on the FSI interface
+        bool writeFaceDiagnostics_;
+
+        //- Zero-based mode index for face diagnostics
+        label faceDiagnosticsMode_;
+
         //- Number of startup calls already treated as Wilson-theta initialisation
         label startupStepCount_;
+
+        //- Last physical time index already processed by update()
+        label lastUpdateTimeIndex_;
 
 
     // Private Member Functions

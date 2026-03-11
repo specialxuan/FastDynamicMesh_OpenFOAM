@@ -45,7 +45,13 @@ fastDynamicFvMesh::fastDynamicFvMesh(const IOobject& io)
     nMode_(0),
     theta_(1.4), // Default Wilson-Theta
     mappingTolerance_(4e-6),
-    startupStepCount_(0)
+    couplingRelaxation_(1.0),
+    pressureFieldName_("p"),
+    rhoRef_(-1.0),
+    writeFaceDiagnostics_(false),
+    faceDiagnosticsMode_(-1),
+    startupStepCount_(0),
+    lastUpdateTimeIndex_(-1)
 {
     readControls();
     readModeShapes();
@@ -74,16 +80,76 @@ void fastDynamicFvMesh::readControls()
         )
     );
     
-    if (dynamicMeshDict.found(typeName + "Coeffs"))
+    if (!dynamicMeshDict.found(typeName + "Coeffs"))
     {
-        const dictionary& fdmDict = dynamicMeshDict.subDict(typeName + "Coeffs");
-        fdmDict.readIfPresent("theta", theta_);
-        fdmDict.lookup("fsiPatches") >> fsiPatches_;
-        fdmDict.readIfPresent("mappingTolerance", mappingTolerance_);
+        FatalIOErrorInFunction(dynamicMeshDict)
+            << "Missing required sub-dictionary '" << typeName << "Coeffs' in "
+            << dynamicMeshDict.objectPath() << nl
+            << "Add constant/dynamicMeshDict entries for " << typeName << '.'
+            << exit(FatalIOError);
     }
-    else
+
+    const dictionary& fdmDict = dynamicMeshDict.subDict(typeName + "Coeffs");
+
+    fdmDict.readIfPresent("theta", theta_);
+
+    if (!fdmDict.found("fsiPatches"))
     {
-        Info << "Warning: " << typeName << "Coeffs not found, using defaults." << endl;
+        FatalIOErrorInFunction(dynamicMeshDict)
+            << "Missing required entry 'fsiPatches' in sub-dictionary '"
+            << typeName << "Coeffs' of " << dynamicMeshDict.objectPath()
+            << exit(FatalIOError);
+    }
+
+    fdmDict.lookup("fsiPatches") >> fsiPatches_;
+
+    if (!fsiPatches_.size())
+    {
+        FatalErrorInFunction
+            << "At least one FSI patch name must be provided in "
+            << dynamicMeshDict.objectPath() << exit(FatalError);
+    }
+
+    fdmDict.readIfPresent("mappingTolerance", mappingTolerance_);
+    fdmDict.readIfPresent("couplingRelaxation", couplingRelaxation_);
+    fdmDict.readIfPresent("pressureField", pressureFieldName_);
+    const bool foundRhoRef = fdmDict.readIfPresent("rhoRef", rhoRef_);
+
+    if (couplingRelaxation_ <= 0 || couplingRelaxation_ > 1)
+    {
+        FatalIOErrorInFunction(dynamicMeshDict)
+            << "Entry 'couplingRelaxation' must be in the range (0, 1] in "
+            << "sub-dictionary '" << typeName << "Coeffs' of "
+            << dynamicMeshDict.objectPath() << exit(FatalIOError);
+    }
+
+    if (foundRhoRef && rhoRef_ <= 0)
+    {
+        FatalIOErrorInFunction(dynamicMeshDict)
+            << "Entry 'rhoRef' must be positive in sub-dictionary '"
+            << typeName << "Coeffs' of " << dynamicMeshDict.objectPath()
+            << exit(FatalIOError);
+    }
+
+    label faceDiagnosticsMode = -1;
+    const bool foundFaceDiagnosticsMode =
+        fdmDict.readIfPresent("faceDiagnosticsMode", faceDiagnosticsMode);
+
+    fdmDict.readIfPresent("writeFaceDiagnostics", writeFaceDiagnostics_);
+
+    if (foundFaceDiagnosticsMode)
+    {
+        writeFaceDiagnostics_ = true;
+        faceDiagnosticsMode_ = faceDiagnosticsMode - 1;
+    }
+
+    if (writeFaceDiagnostics_ && faceDiagnosticsMode_ < 0)
+    {
+        FatalIOErrorInFunction(dynamicMeshDict)
+            << "When 'writeFaceDiagnostics' is enabled, provide a positive "
+            << "'faceDiagnosticsMode' entry in sub-dictionary '"
+            << typeName << "Coeffs' of " << dynamicMeshDict.objectPath()
+            << exit(FatalIOError);
     }
 }
 
@@ -180,8 +246,10 @@ void fastDynamicFvMesh::readModeShapes()
         std::ifstream file(coorPath);
         if (!file.good())
         {
-             // Warning instead of FatalError to allow testing without files
-             WarningInFunction << "Cannot open " << coorPath << endl;
+            FatalErrorInFunction
+                << "Cannot open required mode coordinate file " << coorPath << nl
+                << "Provide mode/FluidNodeCoor.csv in the case root before "
+                << "running fastDynamicFvMesh." << exit(FatalError);
         }
         else
         {
@@ -192,7 +260,13 @@ void fastDynamicFvMesh::readModeShapes()
             std::getline(file, line);
             std::replace(line.begin(), line.end(), ',', ' ');
             std::stringstream ss(line);
-            ss >> dummy >> nNode >> nMode;
+            if (!(ss >> dummy >> nNode >> nMode) || nNode <= 0 || nMode <= 0)
+            {
+                FatalErrorInFunction
+                    << "Invalid FluidNodeCoor.csv header in " << coorPath << nl
+                    << "Expected three comma-separated values with positive "
+                    << "node and mode counts." << exit(FatalError);
+            }
             
             nCsvNodes = label(nNode);
             nMode_ = label(nMode);
@@ -215,10 +289,20 @@ void fastDynamicFvMesh::readModeShapes()
                 // file >> x >> c >> y >> c >> z; 
                 // This fails if there are spaces around comma.
                 // Better: read line, replace commas, read numbers
-                std::getline(file, line);
+                if (!std::getline(file, line))
+                {
+                    FatalErrorInFunction
+                        << "Unexpected end of file while reading node " << i
+                        << " from " << coorPath << exit(FatalError);
+                }
                 std::replace(line.begin(), line.end(), ',', ' ');
                 std::stringstream ss2(line);
-                ss2 >> x >> y >> z;
+                if (!(ss2 >> x >> y >> z))
+                {
+                    FatalErrorInFunction
+                        << "Invalid coordinate entry for node " << i << " in "
+                        << coorPath << exit(FatalError);
+                }
                 
                 csvPoints[i] = point(x, y, z);
             }
@@ -226,43 +310,93 @@ void fastDynamicFvMesh::readModeShapes()
             // Read mode shapes
             for (label m=0; m<nMode_; ++m)
             {
-                 fileName shapePath = modeDir/("FluidNodeDisp" + std::to_string(m+1) + ".csv");
-                 std::ifstream mFile(shapePath);
-                 
-                 string line;
-                 std::getline(mFile, line);
-                 // First line is frequency
-                 std::stringstream ss(line);
-                 scalar freq;
-                 if (ss >> freq)
-                 {
-                    modeFreq_[m] = freq;
-                    Info<< "  Mode " << m << " Freq: " << freq << endl;
-                 }
-                 else
-                 {
-                    Info<< "  Warning: Failed to read frequency for mode " << m << endl;
-                 }
-                 
-                 // Second line is header, skip?
-                 // Wait, original logic read `freq` then skipped line.
-                 // The file format:
-                 // Frequency
-                 // Header
-                 // Data
-                 
-                 std::getline(mFile, line); // Skip header line
-                 
-                 for (label i=0; i<nCsvNodes; ++i)
-                 {
-                     std::getline(mFile, line);
-                     std::replace(line.begin(), line.end(), ',', ' ');
-                     std::stringstream ss2(line);
-                     
-                     scalar dx, dy, dz;
-                     ss2 >> dx >> dy >> dz;
-                     csvShapes[m][i] = vector(dx, dy, dz);
-                 }
+                fileName shapePath = modeDir/("FluidNodeDisp" + std::to_string(m+1) + ".csv");
+                std::ifstream mFile(shapePath);
+
+                if (!mFile.good())
+                {
+                    FatalErrorInFunction
+                        << "Cannot open required mode shape file " << shapePath
+                        << exit(FatalError);
+                }
+
+                string line;
+                if (!std::getline(mFile, line))
+                {
+                    FatalErrorInFunction
+                        << "Missing frequency line in " << shapePath
+                        << exit(FatalError);
+                }
+
+                std::replace(line.begin(), line.end(), ',', ' ');
+                std::stringstream ss(line);
+                scalar freq = 0.0;
+                scalar fileNodeCount = 0.0;
+                scalar fileModeCount = 0.0;
+
+                if (!(ss >> freq))
+                {
+                    FatalErrorInFunction
+                        << "Failed to read frequency from " << shapePath
+                        << exit(FatalError);
+                }
+
+                if ((ss >> fileNodeCount) && (ss >> fileModeCount))
+                {
+                    if
+                    (
+                        label(fileNodeCount) != nCsvNodes
+                     || label(fileModeCount) != nMode_
+                    )
+                    {
+                        FatalErrorInFunction
+                            << "Mode file " << shapePath
+                            << " reports " << label(fileNodeCount)
+                            << " nodes and " << label(fileModeCount)
+                            << " modes, but FluidNodeCoor.csv reports "
+                            << nCsvNodes << " nodes and " << nMode_
+                            << " modes." << exit(FatalError);
+                    }
+                }
+
+                modeFreq_[m] = freq;
+                Info<< "  Mode " << m << " Freq: " << freq << endl;
+
+                label dataRow = 0;
+
+                while (dataRow < nCsvNodes)
+                {
+                    if (!std::getline(mFile, line))
+                    {
+                        FatalErrorInFunction
+                            << "Unexpected end of file while reading node "
+                            << dataRow << " from " << shapePath
+                            << exit(FatalError);
+                    }
+
+                    std::replace(line.begin(), line.end(), ',', ' ');
+                    std::stringstream ss2(line);
+
+                    scalar dx = 0.0;
+                    scalar dy = 0.0;
+                    scalar dz = 0.0;
+
+                    if (!(ss2 >> dx >> dy >> dz))
+                    {
+                        if (dataRow == 0)
+                        {
+                            continue;
+                        }
+
+                        FatalErrorInFunction
+                            << "Invalid displacement entry for node "
+                            << dataRow << " in " << shapePath
+                            << exit(FatalError);
+                    }
+
+                    csvShapes[m][dataRow] = vector(dx, dy, dz);
+                    ++dataRow;
+                }
             }
         }
     }
@@ -274,11 +408,30 @@ void fastDynamicFvMesh::readModeShapes()
     // Resize local arrays
     if (!Pstream::master()) modeFreq_.setSize(nMode_); // Only slaves need resize now
 
+    if (nMode_ <= 0)
+    {
+        FatalErrorInFunction
+            << "No fluid modes were loaded from " << modeDir << nl
+            << "Ensure mode/FluidNodeCoor.csv and mode/FluidNodeDisp*.csv are "
+            << "present and valid." << exit(FatalError);
+    }
+
+    if (writeFaceDiagnostics_ && faceDiagnosticsMode_ >= nMode_)
+    {
+        FatalErrorInFunction
+            << "Requested faceDiagnosticsMode " << (faceDiagnosticsMode_ + 1)
+            << " but only " << nMode_ << " modes were loaded."
+            << exit(FatalError);
+    }
+
     modeForce_.setSize(nMode_, 0.0);
+    modePressureForce_.setSize(nMode_, 0.0);
+    modeShearForce_.setSize(nMode_, 0.0);
     modeForce0_.setSize(nMode_, 0.0);
     modeState_.setSize(nMode_, vector::zero);
     modeState0_.setSize(nMode_, vector::zero);
     initVelocity_.setSize(nMode_, 0.0);
+    appliedModeDisp_.setSize(nMode_, 0.0);
 
     readLegacyParameters(modeDir);
 
@@ -334,7 +487,31 @@ void fastDynamicFvMesh::readModeShapes()
             }
         }
     }
-    Info<< "Mapped " << mappedCount << " points out of " << localPoints.size() << " local mesh points." << endl;
+
+    const label totalMapped = returnReduce(mappedCount, sumOp<label>());
+    const label totalPoints = returnReduce(label(localPoints.size()), sumOp<label>());
+
+    if (Pstream::master())
+    {
+        Info<< "Mapped " << totalMapped << " points out of "
+            << totalPoints << " mesh points." << endl;
+    }
+
+    if (totalMapped == 0)
+    {
+        FatalErrorInFunction
+            << "Mapped 0 mesh points from " << modeDir << nl
+            << "Check that the mode CSV coordinates correspond to the current "
+            << "mesh and that mappingTolerance is large enough." << exit(FatalError);
+    }
+
+    if (Pstream::master() && totalMapped != totalPoints)
+    {
+        WarningInFunction
+            << "Mapped " << totalMapped << " of " << totalPoints
+            << " mesh points. Unmapped points will remain stationary."
+            << endl;
+    }
 }
 
 tmp<scalarField> fastDynamicFvMesh::patchDensity
@@ -454,25 +631,36 @@ void fastDynamicFvMesh::calcModalForces()
 {
     // Initialize forces
     modeForce_ = 0.0;
+    modePressureForce_ = 0.0;
+    modeShearForce_ = 0.0;
 
-    // Default density (kinematic = 1.0)
-    // Hardcoded for water validation case
-    scalar rho = 1000.0;
-
-    // Check if we have rho field (compressible)
-    if (this->foundObject<volScalarField>("rho"))
+    if (!this->foundObject<volScalarField>(pressureFieldName_))
     {
-        // For compressible, forces should naturally integrate p (which is P_abs).
-        // BUT, OpenFOAM compressible p is usually Pa.
-        // Incompressible p is m^2/s^2.
-        // We assume here the user wants forces in Newtons.
-        // If "rho" field exists, p is likely Pa, so we don't multiply by rho.
-        // So rho factor remains 1.0.
-        rho = 1.0;
+        FatalErrorInFunction
+            << "Required pressure field '" << pressureFieldName_
+            << "' was not found. Configure 'pressureField' in dynamicMeshDict "
+            << "or supply the field before fastDynamicFvMesh::update()."
+            << exit(FatalError);
     }
-    else
+
+    const volScalarField& p = this->lookupObject<volScalarField>(pressureFieldName_);
+    const dimensionSet kinematicPressureDims(dimPressure/dimDensity);
+    const bool dimensionalPressure = (p.dimensions() == dimPressure);
+    const bool kinematicPressure = (p.dimensions() == kinematicPressureDims);
+
+    if (!dimensionalPressure && !kinematicPressure)
     {
-        // Incompressible: p is p_kinematic. Need rhoRef.
+        FatalErrorInFunction
+            << "Pressure field '" << pressureFieldName_ << "' has dimensions "
+            << p.dimensions() << ". Expected either " << dimPressure
+            << " (pressure) or " << kinematicPressureDims
+            << " (kinematic pressure)." << exit(FatalError);
+    }
+
+    scalar defaultRho = rhoRef_;
+
+    if (kinematicPressure && defaultRho <= 0)
+    {
         IOdictionary transportProperties
         (
             IOobject
@@ -487,13 +675,68 @@ void fastDynamicFvMesh::calcModalForces()
 
         if (transportProperties.found("rho"))
         {
-             transportProperties.lookup("rho") >> rho;
+            transportProperties.lookup("rho") >> defaultRho;
         }
     }
 
-    if (Pstream::master())
+    if (kinematicPressure && defaultRho <= 0 && !this->foundObject<volScalarField>("rho"))
     {
-        Info<< "DEBUG: Using rho=" << rho << endl;
+        FatalErrorInFunction
+            << "Pressure field '" << pressureFieldName_
+            << "' is kinematic, but no density information was found." << nl
+            << "Provide 'rhoRef' in dynamicMeshDict, a 'rho' entry in "
+            << "constant/transportProperties, or a volScalarField named 'rho'."
+            << exit(FatalError);
+    }
+
+    std::ofstream faceDiagFile;
+    bool writeFaceDiagHeader = false;
+    bool haveFaceDiagFile = false;
+
+    if (writeFaceDiagnostics_)
+    {
+        fileName diagnosticsRoot = this->time().path();
+
+        if (Pstream::parRun())
+        {
+            diagnosticsRoot = this->time().path().path();
+        }
+
+        const word modeLabel("mode" + Foam::name(faceDiagnosticsMode_ + 1));
+        fileName faceDiagnosticsPath =
+            diagnosticsRoot/
+            ("faceDiagnostics_" + modeLabel + "_proc"
+           + Foam::name(Pstream::myProcNo()) + ".csv");
+
+        std::ifstream check(faceDiagnosticsPath.c_str());
+        writeFaceDiagHeader = !check.good();
+        check.close();
+
+        faceDiagFile.open(faceDiagnosticsPath.c_str(), std::ios::app);
+
+        if (!faceDiagFile.good())
+        {
+            WarningInFunction
+                << "Unable to open " << faceDiagnosticsPath
+                << " for face-level diagnostics." << endl;
+        }
+        else
+        {
+            haveFaceDiagFile = true;
+            faceDiagFile << std::setprecision(12);
+
+            if (writeFaceDiagHeader)
+            {
+                faceDiagFile
+                    << "Processor,Time,Patch,PatchFace,MeshFace,"
+                    << "Cx,Cy,Cz,"
+                    << "AreaX,AreaY,AreaZ,"
+                    << "ShapeX,ShapeY,ShapeZ,"
+                    << "PressureForceX,PressureForceY,PressureForceZ,"
+                    << "ShearForceX,ShearForceY,ShearForceZ,"
+                    << "PressureContribution,ShearContribution,TotalContribution\n";
+            }
+        }
     }
 
     tmp<volTensorField> tGradU;
@@ -512,71 +755,130 @@ void fastDynamicFvMesh::calcModalForces()
             << "to modal forces will be skipped." << endl;
     }
 
-    if (this->foundObject<volScalarField>("p"))
+    // Debug p range
+    scalar pMin = gMin(p);
+    scalar pMax = gMax(p);
+    if (Pstream::master())
     {
-        const volScalarField& p = this->lookupObject<volScalarField>("p");
+        Info << "DEBUG: " << pressureFieldName_ << " range [" << pMin << ", "
+             << pMax << "]" << endl;
 
-        // Debug p range
-        scalar pMin = gMin(p);
-        scalar pMax = gMax(p);
-        if (Pstream::master())
+        if (kinematicPressure)
         {
-             Info << "DEBUG: p range [" << pMin << ", " << pMax << "]" << endl;
+            Info << "DEBUG: pressure field is kinematic; density comes from "
+                 << (this->foundObject<volScalarField>("rho") ? "field rho" : "rhoRef/transportProperties")
+                 << endl;
+        }
+    }
+
+    // Iterate over FSI patches
+    forAll(fsiPatches_, i)
+    {
+        label patchID = this->boundaryMesh().findPatchID(fsiPatches_[i]);
+        if (patchID == -1)
+        {
+            FatalErrorInFunction
+                << "Configured FSI patch '" << fsiPatches_[i]
+                << "' was not found in boundaryMesh." << exit(FatalError);
         }
 
-        // Iterate over FSI patches
-        forAll(fsiPatches_, i)
+        const polyPatch& pp = this->boundaryMesh()[patchID];
+        const fvPatchScalarField& pPatch = p.boundaryField()[patchID];
+        const vectorField faceAreas(pp.faceAreas());
+        const vectorField faceCentres(pp.faceCentres());
+
+        tmp<scalarField> tPressureScale
+        (
+            new scalarField(pp.size(), 1.0)
+        );
+
+        if (kinematicPressure)
         {
-            label patchID = this->boundaryMesh().findPatchID(fsiPatches_[i]);
-            if (patchID == -1)
+            tPressureScale = patchDensity(patchID, defaultRho);
+        }
+
+        const scalarField& pressureScale = tPressureScale();
+
+        const symmTensorField* devStressPtr = nullptr;
+        tmp<symmTensorField> tDevStress;
+
+        if (gradUPtr)
+        {
+            const tensorField& gradPatch = gradUPtr->boundaryField()[patchID];
+            tDevStress = devRhoReff(gradPatch, patchID, defaultRho > 0 ? defaultRho : 1.0);
+            devStressPtr = &tDevStress();
+        }
+
+        // Loop over faces
+        forAll(pp, faceI)
+        {
+            const vector& areaVec = faceAreas[faceI];
+            const vector pressureForce = pressureScale[faceI] * pPatch[faceI] * areaVec;
+            vector shearForce = vector::zero;
+
+            if (devStressPtr)
             {
-                Info<< "Warning: FSI patch " << fsiPatches_[i] << " not found!" << endl;
-                continue;
-            }
+                shearForce = areaVec & (*devStressPtr)[faceI];
+                const scalar areaMag = mag(areaVec);
 
-            const polyPatch& pp = this->boundaryMesh()[patchID];
-            const fvPatchScalarField& pPatch = p.boundaryField()[patchID];
-            const vectorField faceAreas(pp.faceAreas());
-
-            const symmTensorField* devStressPtr = nullptr;
-            tmp<symmTensorField> tDevStress;
-
-            if (gradUPtr)
-            {
-                const tensorField& gradPatch = gradUPtr->boundaryField()[patchID];
-                tDevStress = devRhoReff(gradPatch, patchID, rho);
-                devStressPtr = &tDevStress();
-            }
-
-            // Loop over faces
-            forAll(pp, faceI)
-            {
-                const vector& areaVec = faceAreas[faceI];
-                vector faceForce = rho * pPatch[faceI] * areaVec;
-
-                if (devStressPtr)
+                if (areaMag > VSMALL)
                 {
-                    faceForce += areaVec & (*devStressPtr)[faceI];
+                    const vector faceNormal = areaVec/areaMag;
+                    shearForce -= faceNormal*(faceNormal & shearForce);
+                }
+            }
+
+            // Get face points to interpolate mode shape
+            const labelList& fPoints = pp[faceI];
+
+            for (label m=0; m<nMode_; ++m)
+            {
+                // Average mode shape at face center
+                vector shapeFace = vector::zero;
+                forAll(fPoints, fp)
+                {
+                    shapeFace += modeShapes_[m][fPoints[fp]];
+                }
+                if (fPoints.size() > 0)
+                {
+                    shapeFace /= fPoints.size();
                 }
 
-                // Get face points to interpolate mode shape
-                const labelList& fPoints = pp[faceI];
+                const scalar pressureModeForce = pressureForce & shapeFace;
+                const scalar shearModeForce = shearForce & shapeFace;
 
-                for (label m=0; m<nMode_; ++m)
+                modePressureForce_[m] += pressureModeForce;
+                modeShearForce_[m] += shearModeForce;
+                modeForce_[m] += pressureModeForce + shearModeForce;
+
+                if (haveFaceDiagFile && m == faceDiagnosticsMode_)
                 {
-                    // Average mode shape at face center
-                    vector shapeFace = vector::zero;
-                    forAll(fPoints, fp)
-                    {
-                        shapeFace += modeShapes_[m][fPoints[fp]];
-                    }
-                    if (fPoints.size() > 0)
-                    {
-                        shapeFace /= fPoints.size();
-                    }
+                    const point& faceCentre = faceCentres[faceI];
 
-                    // Project force
-                    modeForce_[m] += faceForce & shapeFace;
+                    faceDiagFile
+                        << Pstream::myProcNo() << ','
+                        << this->time().value() << ','
+                        << pp.name() << ','
+                        << faceI << ','
+                        << (pp.start() + faceI) << ','
+                        << faceCentre.x() << ','
+                        << faceCentre.y() << ','
+                        << faceCentre.z() << ','
+                        << areaVec.x() << ','
+                        << areaVec.y() << ','
+                        << areaVec.z() << ','
+                        << shapeFace.x() << ','
+                        << shapeFace.y() << ','
+                        << shapeFace.z() << ','
+                        << pressureForce.x() << ','
+                        << pressureForce.y() << ','
+                        << pressureForce.z() << ','
+                        << shearForce.x() << ','
+                        << shearForce.y() << ','
+                        << shearForce.z() << ','
+                        << pressureModeForce << ','
+                        << shearModeForce << ','
+                        << (pressureModeForce + shearModeForce) << '\n';
                 }
             }
         }
@@ -584,14 +886,23 @@ void fastDynamicFvMesh::calcModalForces()
 
     // Parallel reduction
     Pstream::listCombineGather(modeForce_, plusEqOp<scalar>());
+    Pstream::listCombineGather(modePressureForce_, plusEqOp<scalar>());
+    Pstream::listCombineGather(modeShearForce_, plusEqOp<scalar>());
     Pstream::broadcast(modeForce_);
+    Pstream::broadcast(modePressureForce_);
+    Pstream::broadcast(modeShearForce_);
 
     if (Pstream::master())
     {
-         Info << "DEBUG: rho=" << rho << endl;
-         Info << "DEBUG: Mode Forces (0-4): ";
-         for(label i=0; i<min(5, nMode_); ++i) Info << modeForce_[i] << " ";
-         Info << endl;
+        Info << "DEBUG: Mode Forces p/shear/total (0-4): ";
+        for (label i=0; i<min(5, nMode_); ++i)
+        {
+            Info << '['
+                 << modePressureForce_[i] << ','
+                 << modeShearForce_[i] << ','
+                 << modeForce_[i] << "] ";
+        }
+        Info << endl;
     }
 }
 
@@ -666,21 +977,29 @@ void fastDynamicFvMesh::writeDiagnostics() const
         return;
     }
 
+    fileName diagnosticsPath = this->time().path()/"modal_diagnostics.csv";
+
+    if (Pstream::parRun())
+    {
+        diagnosticsPath = this->time().path().path()/"modal_diagnostics.csv";
+    }
+
     std::ofstream diagFile;
     bool writeHeader = false;
 
-    std::ifstream check("modal_diagnostics.csv");
+    std::ifstream check(diagnosticsPath.c_str());
     if (!check.good())
     {
         writeHeader = true;
     }
     check.close();
 
-    diagFile.open("modal_diagnostics.csv", std::ios::app);
+    diagFile.open(diagnosticsPath.c_str(), std::ios::app);
 
     if (!diagFile.good())
     {
-        WarningInFunction << "Unable to open modal_diagnostics.csv for writing." << endl;
+        WarningInFunction << "Unable to open " << diagnosticsPath
+            << " for writing." << endl;
         return;
     }
 
@@ -694,9 +1013,20 @@ void fastDynamicFvMesh::writeDiagnostics() const
 
         for (label i=0; i<nMode_; ++i)
         {
+            diagFile << ",PressureForce_" << (i+1);
+        }
+
+        for (label i=0; i<nMode_; ++i)
+        {
+            diagFile << ",ShearForce_" << (i+1);
+        }
+
+        for (label i=0; i<nMode_; ++i)
+        {
             diagFile << ",Disp_" << (i+1)
                      << ",Vel_" << (i+1)
-                     << ",Acc_" << (i+1);
+                     << ",Acc_" << (i+1)
+                     << ",AppliedDisp_" << (i+1);
         }
 
         diagFile << "\n";
@@ -712,9 +1042,20 @@ void fastDynamicFvMesh::writeDiagnostics() const
 
     for (label i=0; i<nMode_; ++i)
     {
+        diagFile << "," << modePressureForce_[i];
+    }
+
+    for (label i=0; i<nMode_; ++i)
+    {
+        diagFile << "," << modeShearForce_[i];
+    }
+
+    for (label i=0; i<nMode_; ++i)
+    {
         diagFile << "," << modeState_[i].x()
                  << "," << modeState_[i].y()
-                 << "," << modeState_[i].z();
+                 << "," << modeState_[i].z()
+                 << "," << appliedModeDisp_[i];
     }
 
     diagFile << "\n";
@@ -723,6 +1064,13 @@ void fastDynamicFvMesh::writeDiagnostics() const
 bool fastDynamicFvMesh::update()
 {
     if (Pstream::master()) Info<< "DEBUG: Starting update()" << endl;
+
+    const label currentTimeIndex = this->time().timeIndex();
+    if (currentTimeIndex == lastUpdateTimeIndex_)
+    {
+        return false;
+    }
+    lastUpdateTimeIndex_ = currentTimeIndex;
 
     // 1. Calculate time step
     scalar dt = this->time().deltaTValue();
@@ -757,6 +1105,7 @@ bool fastDynamicFvMesh::update()
             modeState_[i] = vector(0.0, v, a);
             modeState0_[i] = modeState_[i];
             modeForce0_[i] = modeForce_[i];
+            appliedModeDisp_[i] = 0.0;
         }
 
         ++startupStepCount_;
@@ -786,15 +1135,23 @@ bool fastDynamicFvMesh::update()
     // Debug output:
     if (Pstream::master() && nMode_ > 0)
     {
-        Info<< "Time: " << this->time().value() << " First Mode Disp: " << modeState_[0].x() << endl;
+        Info<< "Time: " << this->time().value()
+            << " First Mode Disp: " << modeState_[0].x()
+            << " Applied: " << appliedModeDisp_[0] << endl;
     }
 
     for (label m=0; m<nMode_; ++m)
     {
         const vectorField& shape = modeShapes_[m];
 
-        // Incremental displacement: new - old
-        scalar dDisp = modeState_[m].x() - modeState0_[m].x();
+        const scalar appliedDisp0 = appliedModeDisp_[m];
+        const scalar appliedDisp =
+            appliedDisp0
+          + couplingRelaxation_*(modeState_[m].x() - appliedDisp0);
+
+        // Incremental displacement actually imposed on the mesh
+        scalar dDisp = appliedDisp - appliedDisp0;
+        appliedModeDisp_[m] = appliedDisp;
 
         forAll(newPoints, pI)
         {
