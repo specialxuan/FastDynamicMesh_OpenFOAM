@@ -10,9 +10,13 @@
         "ield",
         "libfast",
         "libso",
+        "patchi",
         "pcorr",
         "peration",
         "Pstream",
+        "Reff",
+        "symm",
+        "Turb",
         "wmake"
     ]
 }

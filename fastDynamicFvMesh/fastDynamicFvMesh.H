@@ -66,11 +66,14 @@ class fastDynamicFvMesh
         //- Wilson-Theta parameter
         scalar theta_;
 
+        //- Point-mapping tolerance used for legacy CSV node matching
+        scalar mappingTolerance_;
+
         //- FSI patch names
         wordRes fsiPatches_;
 
-        //- Initialized flag
-        bool initialised_;
+        //- Number of startup calls already treated as Wilson-theta initialisation
+        label startupStepCount_;
 
 
     // Private Member Functions
@@ -81,11 +84,28 @@ class fastDynamicFvMesh
         //- Read mode shapes from external files
         void readModeShapes();
 
+        //- Read legacy runtime parameters from FluidPara.csv
+        void readLegacyParameters(const fileName& modeDir);
+
         //- Calculate modal forces from fluid pressure and shear stress
         void calcModalForces();
 
+        //- Return patch density used for shear calculations
+        tmp<scalarField> patchDensity(const label patchi, scalar defaultRho) const;
+
+        //- Deviatoric effective stress tensor for wall shear evaluation
+        tmp<symmTensorField> devRhoReff
+        (
+            const tensorField& gradUp,
+            const label patchi,
+            scalar defaultRho
+        ) const;
+
         //- Solve structural dynamics using Wilson-Theta method
         void solveStructuralDynamics(scalar dt);
+
+        //- Write modal force/displacement diagnostics
+        void writeDiagnostics() const;
 
         //- Disallow default bitwise copy construct
         fastDynamicFvMesh(const fastDynamicFvMesh&);

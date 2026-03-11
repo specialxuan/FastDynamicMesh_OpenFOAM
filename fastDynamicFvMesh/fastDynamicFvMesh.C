@@ -14,6 +14,11 @@ Description
 #include "addToRunTimeSelectionTable.H"
 #include "volFields.H"
 #include "surfaceFields.H"
+#include "fvcGrad.H"
+#include "turbulentTransportModel.H"
+#include "turbulentFluidThermoModel.H"
+#include "fluidThermo.H"
+#include "transportModel.H"
 #include "syncTools.H"
 #include "SortableList.H"
 #include "Pstream.H"
@@ -39,7 +44,8 @@ fastDynamicFvMesh::fastDynamicFvMesh(const IOobject& io)
     dynamicFvMesh(io),
     nMode_(0),
     theta_(1.4), // Default Wilson-Theta
-    initialised_(false)
+    mappingTolerance_(4e-6),
+    startupStepCount_(0)
 {
     readControls();
     readModeShapes();
@@ -71,12 +77,83 @@ void fastDynamicFvMesh::readControls()
     if (dynamicMeshDict.found(typeName + "Coeffs"))
     {
         const dictionary& fdmDict = dynamicMeshDict.subDict(typeName + "Coeffs");
-        fdmDict.lookup("theta") >> theta_;
+        fdmDict.readIfPresent("theta", theta_);
         fdmDict.lookup("fsiPatches") >> fsiPatches_;
+        fdmDict.readIfPresent("mappingTolerance", mappingTolerance_);
     }
     else
     {
         Info << "Warning: " << typeName << "Coeffs not found, using defaults." << endl;
+    }
+}
+
+void fastDynamicFvMesh::readLegacyParameters(const fileName& modeDir)
+{
+    if (!Pstream::master())
+    {
+        return;
+    }
+
+    fileName paraPath = modeDir/"FluidPara.csv";
+    std::ifstream paraFile(paraPath);
+
+    if (!paraFile.good())
+    {
+        Info<< "Legacy parameter file " << paraPath
+            << " not found; using zero initial modal velocities." << endl;
+        return;
+    }
+
+    auto readCsvScalar = [&](scalar& value) -> bool
+    {
+        string line;
+
+        while (std::getline(paraFile, line))
+        {
+            std::replace(line.begin(), line.end(), ',', ' ');
+            std::stringstream ss(line);
+
+            if (ss >> value)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    scalar legacyFsiId = -1;
+    scalar legacyFluidId = -1;
+
+    if (!readCsvScalar(legacyFsiId) || !readCsvScalar(legacyFluidId))
+    {
+        WarningInFunction
+            << "Cannot read legacy ids from " << paraPath
+            << ". Initial modal velocities remain zero." << endl;
+
+        return;
+    }
+
+    Info<< "Read legacy FluidPara.csv ids (fsi=" << legacyFsiId
+        << ", fluid=" << legacyFluidId
+        << "). OpenFOAM uses patch names from dynamicMeshDict instead."
+        << endl;
+
+    for (label modeI = 0; modeI < nMode_; ++modeI)
+    {
+        scalar value = 0.0;
+
+        if (!readCsvScalar(value))
+        {
+            WarningInFunction
+                << "Missing initial velocity for mode " << modeI
+                << " in " << paraPath
+                << ". Remaining initial velocities stay at zero." << endl;
+
+            break;
+        }
+
+        initVelocity_[modeI] = value;
     }
 }
 
@@ -86,23 +163,17 @@ void fastDynamicFvMesh::readModeShapes()
     List<point> csvPoints;
     List<List<vector>> csvShapes;
     label nCsvNodes = 0;
+    fileName modeDir = this->time().path()/"mode";
+
+    if (Pstream::parRun() && !exists(modeDir))
+    {
+        modeDir = this->time().path().path()/"mode";
+    }
 
     if (Pstream::master())
     {
         Info<< "Reading mode coordinates..." << endl;
-        
-        // Handle parallel path: time().path() points to processorX in parallel
-        // We need the global case root for mode files
-        fileName modeDir = this->time().path()/"mode";
-        if (Pstream::parRun())
-        {
-             // In parallel, try parent directory if local doesn't exist
-             if (!exists(modeDir))
-             {
-                 modeDir = this->time().path().path()/"mode";
-             }
-        }
-        
+
         fileName coorPath = modeDir/"FluidNodeCoor.csv";
         Info<< "Trying to open: " << coorPath << endl;
 
@@ -115,7 +186,6 @@ void fastDynamicFvMesh::readModeShapes()
         else
         {
             scalar dummy, nNode, nMode;
-            char comma;
             // Add robust parsing for header
             // Read line, replace commas with spaces, read numbers
             string line;
@@ -140,7 +210,6 @@ void fastDynamicFvMesh::readModeShapes()
             for (label i=0; i<nCsvNodes; ++i)
             {
                 scalar x, y, z;
-                char c;
                 // Robust parsing for coordinates
                 // Read 3 numbers separated by commas
                 // file >> x >> c >> y >> c >> z; 
@@ -210,11 +279,14 @@ void fastDynamicFvMesh::readModeShapes()
     modeState_.setSize(nMode_, vector::zero);
     modeState0_.setSize(nMode_, vector::zero);
     initVelocity_.setSize(nMode_, 0.0);
-    
+
+    readLegacyParameters(modeDir);
+
     // Broadcast data
     Pstream::broadcast(modeFreq_);
     Pstream::broadcast(csvPoints);
-    
+    Pstream::broadcast(initVelocity_);
+
     // Resize csvShapes on all procs to ensure loop consistency
     csvShapes.setSize(nMode_);
     
@@ -234,9 +306,8 @@ void fastDynamicFvMesh::readModeShapes()
     label mappedCount = 0;
     if (nCsvNodes > 0)
     {
-        // Increased tolerance for coordinate matching
-        scalar tolSqr = 1e-8; // 0.1 mm tolerance
-        
+        scalar tolSqr = sqr(mappingTolerance_);
+
         forAll(localPoints, pI)
         {
             const point& p = localPoints[pI];
@@ -266,15 +337,128 @@ void fastDynamicFvMesh::readModeShapes()
     Info<< "Mapped " << mappedCount << " points out of " << localPoints.size() << " local mesh points." << endl;
 }
 
+tmp<scalarField> fastDynamicFvMesh::patchDensity
+(
+    const label patchi,
+    const scalar defaultRho
+) const
+{
+    if (this->foundObject<volScalarField>("rho"))
+    {
+        const auto& rhoField = this->lookupObject<volScalarField>("rho");
+        return tmp<scalarField>
+        (
+            new scalarField(rhoField.boundaryField()[patchi])
+        );
+    }
+
+    return tmp<scalarField>
+    (
+        new scalarField(this->boundaryMesh()[patchi].size(), defaultRho)
+    );
+}
+
+tmp<symmTensorField> fastDynamicFvMesh::devRhoReff
+(
+    const tensorField& gradUp,
+    const label patchi,
+    const scalar defaultRho
+) const
+{
+    typedef incompressible::turbulenceModel icoTurbModel;
+    typedef compressible::turbulenceModel cmpTurbModel;
+
+    if (this->foundObject<icoTurbModel>(icoTurbModel::propertiesName))
+    {
+        const auto& turb =
+            this->lookupObject<icoTurbModel>(icoTurbModel::propertiesName);
+
+        tmp<scalarField> tRho = patchDensity(patchi, defaultRho);
+
+        return tmp<symmTensorField>
+        (
+            new symmTensorField
+            (
+                -tRho()*turb.nuEff(patchi)*devTwoSymm(gradUp)
+            )
+        );
+    }
+    else if (this->foundObject<cmpTurbModel>(cmpTurbModel::propertiesName))
+    {
+        const auto& turb =
+            this->lookupObject<cmpTurbModel>(cmpTurbModel::propertiesName);
+
+        return tmp<symmTensorField>
+        (
+            new symmTensorField
+            (
+                -turb.muEff(patchi)*devTwoSymm(gradUp)
+            )
+        );
+    }
+    else if (this->foundObject<fluidThermo>(fluidThermo::dictName))
+    {
+        const auto& thermo = this->lookupObject<fluidThermo>(fluidThermo::dictName);
+
+        return tmp<symmTensorField>
+        (
+            new symmTensorField
+            (
+                -thermo.mu(patchi)*devTwoSymm(gradUp)
+            )
+        );
+    }
+    else if (this->foundObject<transportModel>("transportProperties"))
+    {
+        const auto& laminarT =
+            this->lookupObject<transportModel>("transportProperties");
+
+        tmp<scalarField> tRho = patchDensity(patchi, defaultRho);
+
+        return tmp<symmTensorField>
+        (
+            new symmTensorField
+            (
+                -tRho()*laminarT.nu(patchi)*devTwoSymm(gradUp)
+            )
+        );
+    }
+    else
+    {
+        IOdictionary transportProperties
+        (
+            IOobject
+            (
+                "transportProperties",
+                this->time().constant(),
+                *this,
+                IOobject::MUST_READ,
+                IOobject::NO_WRITE
+            )
+        );
+
+        const dimensionedScalar nu("nu", dimViscosity, transportProperties);
+        tmp<scalarField> tRho = patchDensity(patchi, defaultRho);
+
+        return tmp<symmTensorField>
+        (
+            new symmTensorField
+            (
+                -tRho()*nu.value()*devTwoSymm(gradUp)
+            )
+        );
+    }
+}
+
 void fastDynamicFvMesh::calcModalForces()
 {
     // Initialize forces
     modeForce_ = 0.0;
-    
+
     // Default density (kinematic = 1.0)
     // Hardcoded for water validation case
-    scalar rho = 1000.0; 
-    
+    scalar rho = 1000.0;
+
     // Check if we have rho field (compressible)
     if (this->foundObject<volScalarField>("rho"))
     {
@@ -300,7 +484,7 @@ void fastDynamicFvMesh::calcModalForces()
                 IOobject::NO_WRITE
             )
         );
-        
+
         if (transportProperties.found("rho"))
         {
              transportProperties.lookup("rho") >> rho;
@@ -311,11 +495,27 @@ void fastDynamicFvMesh::calcModalForces()
     {
         Info<< "DEBUG: Using rho=" << rho << endl;
     }
-    
+
+    tmp<volTensorField> tGradU;
+    const volTensorField* gradUPtr = nullptr;
+
+    if (this->foundObject<volVectorField>("U"))
+    {
+        const volVectorField& U = this->lookupObject<volVectorField>("U");
+        tGradU = fvc::grad(U);
+        gradUPtr = &tGradU();
+    }
+    else
+    {
+        WarningInFunction
+            << "Velocity field 'U' not found; wall shear contribution "
+            << "to modal forces will be skipped." << endl;
+    }
+
     if (this->foundObject<volScalarField>("p"))
     {
         const volScalarField& p = this->lookupObject<volScalarField>("p");
-        
+
         // Debug p range
         scalar pMin = gMin(p);
         scalar pMax = gMax(p);
@@ -323,39 +523,45 @@ void fastDynamicFvMesh::calcModalForces()
         {
              Info << "DEBUG: p range [" << pMin << ", " << pMax << "]" << endl;
         }
-        
+
         // Iterate over FSI patches
         forAll(fsiPatches_, i)
         {
             label patchID = this->boundaryMesh().findPatchID(fsiPatches_[i]);
-            if (patchID == -1) 
+            if (patchID == -1)
             {
                 Info<< "Warning: FSI patch " << fsiPatches_[i] << " not found!" << endl;
                 continue;
             }
-            else
-            {
-                //Info<< "Processing FSI patch: " << fsiPatches_[i] << endl;
-            }
 
             const polyPatch& pp = this->boundaryMesh()[patchID];
             const fvPatchScalarField& pPatch = p.boundaryField()[patchID];
+            const vectorField faceAreas(pp.faceAreas());
+
+            const symmTensorField* devStressPtr = nullptr;
+            tmp<symmTensorField> tDevStress;
+
+            if (gradUPtr)
+            {
+                const tensorField& gradPatch = gradUPtr->boundaryField()[patchID];
+                tDevStress = devRhoReff(gradPatch, patchID, rho);
+                devStressPtr = &tDevStress();
+            }
+
             // Loop over faces
             forAll(pp, faceI)
             {
-                // Calculate pressure force on face
-                vector f = pPatch[faceI] * pp.faceAreas()[faceI];
-                
-                // Scale by density if incompressible (rho was set above)
-                // If compressible (rho=1 above), f is already Newtons.
-                // Wait, if compressible, p is Pa. f is N. rho=1. Correct.
-                // If incompressible, p is m2/s2. f is m4/s2. Multiply by kg/m3. f is kg*m/s2 = N. Correct.
-                
-                f *= rho;
+                const vector& areaVec = faceAreas[faceI];
+                vector faceForce = rho * pPatch[faceI] * areaVec;
+
+                if (devStressPtr)
+                {
+                    faceForce += areaVec & (*devStressPtr)[faceI];
+                }
 
                 // Get face points to interpolate mode shape
                 const labelList& fPoints = pp[faceI];
-                
+
                 for (label m=0; m<nMode_; ++m)
                 {
                     // Average mode shape at face center
@@ -364,10 +570,13 @@ void fastDynamicFvMesh::calcModalForces()
                     {
                         shapeFace += modeShapes_[m][fPoints[fp]];
                     }
-                    if (fPoints.size() > 0) shapeFace /= fPoints.size();
-                    
+                    if (fPoints.size() > 0)
+                    {
+                        shapeFace /= fPoints.size();
+                    }
+
                     // Project force
-                    modeForce_[m] += f & shapeFace;
+                    modeForce_[m] += faceForce & shapeFace;
                 }
             }
         }
@@ -383,52 +592,6 @@ void fastDynamicFvMesh::calcModalForces()
          Info << "DEBUG: Mode Forces (0-4): ";
          for(label i=0; i<min(5, nMode_); ++i) Info << modeForce_[i] << " ";
          Info << endl;
-    }
-    
-    // Output diagnostics to file
-    if (Pstream::master())
-    {
-        // Open file in append mode
-        std::ofstream diagFile;
-        bool writeHeader = false;
-        
-        // Simple logic: if file doesn't exist, write header
-        std::ifstream check("modal_diagnostics.csv");
-        if (!check.good())
-        {
-             writeHeader = true;
-        }
-        check.close();
-
-        diagFile.open("modal_diagnostics.csv", std::ios::app);
-
-        if (diagFile.good())
-        {
-            if (writeHeader)
-            {
-                diagFile << "Time";
-                for(label i=0; i<nMode_; ++i) diagFile << ",Force_" << (i+1);
-                for(label i=0; i<nMode_; ++i) 
-                {
-                    diagFile << ",Disp_" << (i+1) 
-                             << ",Vel_" << (i+1) 
-                             << ",Acc_" << (i+1);
-                }
-                diagFile << "\n";
-            }
-            
-            diagFile << std::setprecision(12); // Apply to all
-            diagFile << this->time().value();
-            for(label i=0; i<nMode_; ++i) diagFile << "," << modeForce_[i];
-            for(label i=0; i<nMode_; ++i) 
-            {
-                diagFile << "," << modeState_[i].x() 
-                         << "," << modeState_[i].y() 
-                         << "," << modeState_[i].z();
-            }
-            diagFile << "\n";
-            diagFile.close();
-        }
     }
 }
 
@@ -496,6 +659,67 @@ void fastDynamicFvMesh::solveStructuralDynamics(scalar dt)
     }
 }
 
+void fastDynamicFvMesh::writeDiagnostics() const
+{
+    if (!Pstream::master())
+    {
+        return;
+    }
+
+    std::ofstream diagFile;
+    bool writeHeader = false;
+
+    std::ifstream check("modal_diagnostics.csv");
+    if (!check.good())
+    {
+        writeHeader = true;
+    }
+    check.close();
+
+    diagFile.open("modal_diagnostics.csv", std::ios::app);
+
+    if (!diagFile.good())
+    {
+        WarningInFunction << "Unable to open modal_diagnostics.csv for writing." << endl;
+        return;
+    }
+
+    if (writeHeader)
+    {
+        diagFile << "Time";
+        for (label i=0; i<nMode_; ++i)
+        {
+            diagFile << ",Force_" << (i+1);
+        }
+
+        for (label i=0; i<nMode_; ++i)
+        {
+            diagFile << ",Disp_" << (i+1)
+                     << ",Vel_" << (i+1)
+                     << ",Acc_" << (i+1);
+        }
+
+        diagFile << "\n";
+    }
+
+    diagFile << std::setprecision(12);
+    diagFile << this->time().value();
+
+    for (label i=0; i<nMode_; ++i)
+    {
+        diagFile << "," << modeForce_[i];
+    }
+
+    for (label i=0; i<nMode_; ++i)
+    {
+        diagFile << "," << modeState_[i].x()
+                 << "," << modeState_[i].y()
+                 << "," << modeState_[i].z();
+    }
+
+    diagFile << "\n";
+}
+
 bool fastDynamicFvMesh::update()
 {
     if (Pstream::master()) Info<< "DEBUG: Starting update()" << endl;
@@ -512,34 +736,37 @@ bool fastDynamicFvMesh::update()
     calcModalForces();
     if (Pstream::master()) Info<< "DEBUG: Finished calcModalForces()" << endl;
 
-    // Initialization logic to prevent start-up shock
-    if (!initialised_)
+    if (startupStepCount_ < 2)
     {
         if (Pstream::master())
         {
-            Info<< "Initializing Fast Dynamic Mesh state (acceleration balance)..." << endl;
+            Info<< "Initializing Fast Dynamic Mesh state (startup step "
+                << (startupStepCount_ + 1) << " of 2)..." << endl;
         }
 
         for (label i=0; i<nMode_; ++i)
         {
-             scalar F = modeForce_[i];
-             scalar v = 0.0;
-             if (i < initVelocity_.size()) v = initVelocity_[i];
-             
-             // Initial acceleration to balance force (Mass=1, Damp=0, Stiffness=0 at d=0)
-             scalar a = F; 
-             
-             modeState_[i] = vector(0.0, v, a);
-             
-             // Update history to be consistent for next step
-             modeState0_[i] = modeState_[i];
-             modeForce0_[i] = modeForce_[i];
+            scalar F = modeForce_[i];
+            scalar v = 0.0;
+            if (i < initVelocity_.size()) v = initVelocity_[i];
+
+            // Legacy Fluent UDF initialisation:
+            // D0 = 0, V0 = initVelocity, A0 = F0
+            scalar a = F;
+
+            modeState_[i] = vector(0.0, v, a);
+            modeState0_[i] = modeState_[i];
+            modeForce0_[i] = modeForce_[i];
         }
-        
-        initialised_ = true;
-        
-        // Skip mesh motion on first step
-        if (Pstream::master()) Info<< "DEBUG: Skipping mesh motion (initialization)" << endl;
+
+        ++startupStepCount_;
+        writeDiagnostics();
+
+        if (Pstream::master())
+        {
+            Info<< "DEBUG: Skipping mesh motion during startup initialisation" << endl;
+        }
+
         return true;
     }
 
@@ -576,7 +803,8 @@ bool fastDynamicFvMesh::update()
     }
     
     this->movePoints(newPoints);
-    
+    writeDiagnostics();
+
     return true;
 }
 
