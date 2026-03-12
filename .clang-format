@@ -1,0 +1,28 @@
+# .clang-format for OpenFOAM development
+BasedOnStyle: LLVM
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 80
+
+# 大括号：Allman 风格（换行）
+BreakBeforeBraces: Allman
+
+# 指针/引用：靠近类型（OpenFOAM 风格）
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# 函数调用和声明的参数换行
+AllowAllArgumentsOnNextLine: false
+PenaltyBreakBeforeFirstCallParameter: 1000
+
+# 保留 OpenFOAM 常见的宏格式（如 #include "xxx.H"）
+DisableFormat: false
+
+# 运算符周围空格
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInContainerLiterals: false
+
+# 其他
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
